@@ -896,6 +896,7 @@ static bool login(private_pkcs11_private_key_t *this, int slot)
 	chunk_t pin;
 	CK_RV rv;
 	CK_SESSION_INFO info;
+	CK_TOKEN_INFO token;
 	bool found = FALSE, success = FALSE;
 
 	rv = this->lib->f->C_GetSessionInfo(this->session, &info);
@@ -907,6 +908,19 @@ static bool login(private_pkcs11_private_key_t *this, int slot)
 	if (info.state != CKS_RO_PUBLIC_SESSION &&
 		info.state != CKS_RW_PUBLIC_SESSION)
 	{	/* already logged in with another session, skip */
+		return TRUE;
+	}
+
+	rv = this->lib->f->C_GetTokenInfo(slot, &token);
+	if (rv != CKR_OK)
+	{
+		DBG1(DBG_CFG, "C_GetTokenInfo failed: %N", ck_rv_names, rv);
+	}
+	else if (!(token.flags & CKF_LOGIN_REQUIRED))
+	{	/* the token does not require a login to use its keys, don't try any
+		 * PIN, as failed attempts might count against a retry limit */
+		DBG2(DBG_CFG, "PKCS#11 token '%s':%d does not require a login",
+			 this->lib->get_name(this->lib), slot);
 		return TRUE;
 	}
 
