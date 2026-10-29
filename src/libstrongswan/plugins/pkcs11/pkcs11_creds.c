@@ -16,6 +16,7 @@
 
 #include "pkcs11_creds.h"
 #include "pkcs11_manager.h"
+#include "pkcs11_uri.h"
 
 #include <utils/debug.h>
 #include <collections/linked_list.h>
@@ -263,6 +264,177 @@ pkcs11_creds_t *pkcs11_creds_create(pkcs11_library_t *p11, CK_SLOT_ID slot)
 }
 
 /**
+ * Check if the library, slot and token match the given URI
+ */
+static bool matches_uri(pkcs11_uri_t *uri, pkcs11_library_t *p11,
+						CK_SLOT_ID slot)
+{
+	CK_INFO info;
+	CK_SLOT_INFO slot_info;
+	CK_TOKEN_INFO token_info;
+
+	return p11->f->C_GetInfo(&info) == CKR_OK &&
+		   uri->matches_library(uri, &info) &&
+		   p11->f->C_GetSlotInfo(slot, &slot_info) == CKR_OK &&
+		   uri->matches_slot(uri, slot, &slot_info) &&
+		   p11->f->C_GetTokenInfo(slot, &token_info) == CKR_OK &&
+		   uri->matches_token(uri, &token_info);
+}
+
+/**
+ * See header.
+ */
+bool pkcs11_creds_find_by_uri(char *str, pkcs11_library_t **p11_out,
+							  CK_SLOT_ID *slot_out, chunk_t *ckaid,
+							  chunk_t *value)
+{
+	CK_OBJECT_CLASS class = CKO_CERTIFICATE;
+	CK_CERTIFICATE_TYPE type = CKC_X_509;
+	CK_ATTRIBUTE tmpl[5] = {
+		{CKA_CERTIFICATE_TYPE, &type, sizeof(type)},
+	};
+	CK_ATTRIBUTE attr[] = {
+		{CKA_VALUE, NULL, 0},
+		{CKA_ID, NULL, 0},
+	};
+	CK_OBJECT_HANDLE object;
+	CK_SESSION_HANDLE session;
+	CK_SLOT_ID current;
+	CK_RV rv;
+	pkcs11_manager_t *manager;
+	pkcs11_library_t *p11;
+	pkcs11_uri_t *uri;
+	enumerator_t *enumerator, *certs;
+	int count = 1, found = 0;
+
+	*ckaid = chunk_empty;
+	if (value)
+	{
+		*value = chunk_empty;
+	}
+	uri = pkcs11_uri_create(str);
+	if (!uri)
+	{	/* don't log the URI, it might contain a PIN */
+		DBG1(DBG_CFG, "invalid PKCS#11 URI");
+		return FALSE;
+	}
+	if (uri->get_class(uri, &class) && class != CKO_CERTIFICATE)
+	{
+		DBG1(DBG_CFG, "PKCS#11 URI '%s' does not refer to a certificate",
+			 uri->get_path(uri));
+		uri->destroy(uri);
+		return FALSE;
+	}
+	count += uri->fill_template(uri, &tmpl[count]);
+	if (!uri->get_class(uri, &class))
+	{
+		tmpl[count++] = (CK_ATTRIBUTE){CKA_CLASS, &class, sizeof(class)};
+	}
+
+	manager = lib->get(lib, "pkcs11-manager");
+	if (!manager)
+	{
+		uri->destroy(uri);
+		return FALSE;
+	}
+	enumerator = manager->create_token_enumerator(manager);
+	while (enumerator->enumerate(enumerator, &p11, &current))
+	{
+		if (!matches_uri(uri, p11, current))
+		{
+			continue;
+		}
+		rv = p11->f->C_OpenSession(current, CKF_SERIAL_SESSION, NULL, NULL,
+								   &session);
+		if (rv != CKR_OK)
+		{
+			DBG1(DBG_CFG, "opening PKCS#11 session failed: %N", ck_rv_names, rv);
+			continue;
+		}
+		certs = p11->create_object_enumerator(p11, session, tmpl, count,
+											  attr, countof(attr));
+		while (certs->enumerate(certs, &object))
+		{
+			if (found++ || attr[0].ulValueLen == CK_UNAVAILABLE_INFORMATION)
+			{
+				continue;
+			}
+			*p11_out = p11;
+			*slot_out = current;
+			if (attr[1].ulValueLen != CK_UNAVAILABLE_INFORMATION)
+			{
+				*ckaid = chunk_clone(chunk_create(attr[1].pValue,
+												  attr[1].ulValueLen));
+			}
+			if (value)
+			{
+				*value = chunk_clone(chunk_create(attr[0].pValue,
+												  attr[0].ulValueLen));
+			}
+			DBG1(DBG_CFG, "found certificate '%s' on PKCS#11 token '%s':%d",
+				 uri->get_path(uri), p11->get_name(p11), current);
+		}
+		certs->destroy(certs);
+		p11->f->C_CloseSession(session);
+	}
+	enumerator->destroy(enumerator);
+
+	if (found != 1 || (value && !value->ptr))
+	{
+		if (found > 1)
+		{
+			DBG1(DBG_CFG, "PKCS#11 URI '%s' matches %d certificates, it must "
+				 "identify a single one", uri->get_path(uri), found);
+		}
+		else if (!found)
+		{
+			DBG1(DBG_CFG, "no PKCS#11 certificate found matching '%s'",
+				 uri->get_path(uri));
+		}
+		else
+		{
+			DBG1(DBG_CFG, "reading PKCS#11 certificate '%s' failed",
+				 uri->get_path(uri));
+		}
+		chunk_free(ckaid);
+		if (value)
+		{
+			chunk_free(value);
+		}
+		uri->destroy(uri);
+		return FALSE;
+	}
+	uri->destroy(uri);
+	return TRUE;
+}
+
+/**
+ * Load the certificate referenced by a PKCS#11 URI
+ */
+static certificate_t *load_by_uri(char *uri)
+{
+	pkcs11_library_t *p11;
+	certificate_t *cert;
+	CK_SLOT_ID slot;
+	chunk_t ckaid, data;
+
+	if (!pkcs11_creds_find_by_uri(uri, &p11, &slot, &ckaid, &data))
+	{
+		return NULL;
+	}
+	cert = lib->creds->create(lib->creds, CRED_CERTIFICATE, CERT_X509,
+							  BUILD_BLOB_ASN1_DER, data, BUILD_END);
+	if (!cert)
+	{
+		DBG1(DBG_CFG, "parsing PKCS#11 certificate on '%s':%d failed",
+			 p11->get_name(p11), slot);
+	}
+	chunk_free(&ckaid);
+	chunk_free(&data);
+	return cert;
+}
+
+/**
  * See header.
  */
 certificate_t *pkcs11_creds_load(certificate_type_t type, va_list args)
@@ -273,7 +445,7 @@ certificate_t *pkcs11_creds_load(certificate_type_t type, va_list args)
 	pkcs11_library_t *p11;
 	certificate_t *cert = NULL;
 	CK_SLOT_ID current, slot = -1;
-	char *module = NULL;
+	char *module = NULL, *uri = NULL;
 
 	while (TRUE)
 	{
@@ -288,12 +460,19 @@ certificate_t *pkcs11_creds_load(certificate_type_t type, va_list args)
 			case BUILD_PKCS11_MODULE:
 				module = va_arg(args, char*);
 				continue;
+			case BUILD_PKCS11_URI:
+				uri = va_arg(args, char*);
+				continue;
 			case BUILD_END:
 				break;
 			default:
 				return NULL;
 		}
 		break;
+	}
+	if (uri)
+	{
+		return load_by_uri(uri);
 	}
 	if (!keyid.len)
 	{

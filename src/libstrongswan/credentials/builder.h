@@ -139,6 +139,8 @@ enum builder_part_t {
 	BUILD_PKCS11_SLOT,
 	/** key ID of a key on a token, chunk_t */
 	BUILD_PKCS11_KEYID,
+	/** PKCS#11 URI (RFC 7512) of an object on a token, null terminated char* */
+	BUILD_PKCS11_URI,
 	/** modulus (n) of a RSA key, chunk_t */
 	BUILD_RSA_MODULUS,
 	/** public exponent (e) of a RSA key, chunk_t */

@@ -67,13 +67,28 @@ struct pkcs11_creds_t {
 pkcs11_creds_t *pkcs11_creds_create(pkcs11_library_t *p11, CK_SLOT_ID slot);
 
 /**
+ * Find the single X.509 certificate on the tokens matching a PKCS#11 URI.
+ *
+ * @param uri			PKCS#11 URI (RFC 7512)
+ * @param p11			receives the library of the token
+ * @param slot			receives the slot of the token
+ * @param ckaid			receives the allocated CKA_ID of the certificate, if any
+ * @param value			receives the allocated DER encoding, if not NULL
+ * @return				TRUE if exactly one certificate matches the URI
+ */
+bool pkcs11_creds_find_by_uri(char *uri, pkcs11_library_t **p11,
+							  CK_SLOT_ID *slot, chunk_t *ckaid, chunk_t *value);
+
+/**
  * Load a specific certificate from a token.
  *
  * Requires a BUILD_PKCS11_KEYID argument, and optionally BUILD_PKCS11_MODULE
- * and/or BUILD_PKCS11_SLOT.
+ * and/or BUILD_PKCS11_SLOT.  Alternatively, a BUILD_PKCS11_URI argument
+ * selects a single certificate on any token.
  *
  * @param type			certificate type, must be CERT_X509
- * @param args			variable argument list, containing BUILD_PKCS11_KEYID.
+ * @param args			variable argument list, containing BUILD_PKCS11_KEYID
+ *						or BUILD_PKCS11_URI.
  * @return				loaded certificate, or NULL on failure
  */
 certificate_t *pkcs11_creds_load(certificate_type_t type, va_list args);
