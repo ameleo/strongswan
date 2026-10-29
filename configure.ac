@@ -2056,6 +2056,7 @@ AC_CONFIG_FILES([
 	src/libstrongswan/plugins/agent/Makefile
 	src/libstrongswan/plugins/keychain/Makefile
 	src/libstrongswan/plugins/pkcs11/Makefile
+	src/libstrongswan/plugins/pkcs11/tests/Makefile
 	src/libstrongswan/plugins/chapoly/Makefile
 	src/libstrongswan/plugins/ctr/Makefile
 	src/libstrongswan/plugins/ccm/Makefile

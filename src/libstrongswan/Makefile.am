@@ -707,3 +707,7 @@ endif
 
 SUBDIRS += tests
 
+if USE_PKCS11
+  SUBDIRS += plugins/pkcs11/tests
+endif
+

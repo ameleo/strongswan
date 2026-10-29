@@ -4,14 +4,22 @@ AM_CPPFLAGS = \
 AM_CFLAGS = \
 	$(PLUGIN_CFLAGS)
 
+# these files are also used by the tests, we can't directly refer to them
+# because of the subdirectory, which would cause distclean to fail
+noinst_LTLIBRARIES = libpkcs11.la
+libpkcs11_la_SOURCES = \
+	pkcs11.h pkcs11_uri.h pkcs11_uri.c
+
 if MONOLITHIC
-noinst_LTLIBRARIES = libstrongswan-pkcs11.la
+noinst_LTLIBRARIES += libstrongswan-pkcs11.la
 else
 plugin_LTLIBRARIES = libstrongswan-pkcs11.la
 endif
 
+libstrongswan_pkcs11_la_LIBADD = libpkcs11.la
+
 libstrongswan_pkcs11_la_SOURCES = \
-	pkcs11_plugin.h pkcs11_plugin.c pkcs11.h \
+	pkcs11_plugin.h pkcs11_plugin.c \
 	pkcs11_library.h pkcs11_library.c \
 	pkcs11_creds.h pkcs11_creds.c \
 	pkcs11_private_key.h pkcs11_private_key.c \
