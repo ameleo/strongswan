@@ -527,13 +527,111 @@ static chunk_t read_safe_file(NMStrongswanPluginPrivate *priv,
 }
 
 /**
+ * Get the identity of a smartcard certificate, prefers a more convenient
+ * subjectAltName over the subject DN
+ */
+static identification_t *get_smartcard_id(certificate_t *cert)
+{
+	x509_t *x509 = (x509_t*)cert;
+	enumerator_t *sans;
+	identification_t *id;
+
+	sans = x509->create_subjectAltName_enumerator(x509);
+	if (!sans->enumerate(sans, &id))
+	{
+		id = cert->get_subject(cert);
+	}
+	id = id->clone(id);
+	sans->destroy(sans);
+	return id;
+}
+
+/**
+ * Get the PKCS#11 URI (RFC 7512) of the smartcard certificate to use, if any
+ */
+static char *get_smartcard_uri(NMSettingVpn *vpn)
+{
+	const char *str;
+
+	str = nm_setting_vpn_get_data_item(vpn, "usercert");
+	if (str && strcasepfx(str, "pkcs11:"))
+	{
+		return (char*)str;
+	}
+	return NULL;
+}
+
+/**
+ * Find the smartcard certificate selected by a PKCS#11 URI and its private key
+ * on the same token.  If probe is TRUE, the certificate and key are not
+ * installed for authentication, otherwise the certificate is returned in cert.
+ */
+static identification_t *find_smartcard_key_by_uri(
+									NMStrongswanPluginPrivate *priv, char *uri,
+									char *pin, bool probe, certificate_t **cert,
+									GError **err)
+{
+	identification_t *id;
+	certificate_t *found;
+	private_key_t *key;
+	chunk_t keyid;
+	int len;
+
+	/* only the path is logged, the query might contain a PIN */
+	len = strcspn(uri, "?");
+
+	found = lib->creds->create(lib->creds, CRED_CERTIFICATE, CERT_X509,
+							   BUILD_PKCS11_URI, uri, BUILD_END);
+	if (!found)
+	{
+		g_set_error(err, NM_VPN_PLUGIN_ERROR,
+					NM_VPN_PLUGIN_ERROR_BAD_ARGUMENTS,
+					"No unique smartcard certificate found matching '%.*s'.",
+					len, uri);
+		return NULL;
+	}
+	/* look for the key on the token of the certificate by its CKA_ID, the
+	 * keyid is used to find a PIN and as fallback */
+	keyid = ((x509_t*)found)->get_subjectKeyIdentifier((x509_t*)found);
+	if (!probe)
+	{
+		priv->creds->set_pin(priv->creds, keyid, pin);
+	}
+	key = lib->creds->create(lib->creds, CRED_PRIVATE_KEY, KEY_ANY,
+							 BUILD_PKCS11_URI, uri, BUILD_PKCS11_KEYID, keyid,
+							 BUILD_END);
+	if (!key)
+	{
+		DBG1(DBG_CFG, "private key of smartcard certificate '%Y' not found or "
+			 "not usable", found->get_subject(found));
+		g_set_error(err, NM_VPN_PLUGIN_ERROR,
+					NM_VPN_PLUGIN_ERROR_BAD_ARGUMENTS,
+					"Private key of the smartcard certificate matching '%.*s' "
+					"not found or not usable.", len, uri);
+		found->destroy(found);
+		return NULL;
+	}
+	id = get_smartcard_id(found);
+	if (probe)
+	{
+		key->destroy(key);
+		found->destroy(found);
+		return id;
+	}
+	DBG1(DBG_CFG, "using smartcard certificate '%Y'", id);
+	priv->creds->set_cert_and_key(priv->creds, found, key);
+	*cert = found;
+	return id;
+}
+
+/**
  * Find a certificate for which we have a private key on a smartcard, if probe
  * is TRUE, the certificate and key are not installed for authentication
  */
 static identification_t *find_smartcard_key(NMStrongswanPluginPrivate *priv,
 											char *pin, bool probe)
 {
-	enumerator_t *enumerator, *sans;
+	enumerator_t *enumerator;
 	identification_t *id = NULL;
 	certificate_t *cert;
 	x509_t *x509;
@@ -562,15 +660,7 @@ static identification_t *find_smartcard_key(NMStrongswanPluginPrivate *priv,
 								KEY_ANY, BUILD_PKCS11_KEYID, keyid, BUILD_END);
 				if (key)
 				{
-					/* prefer a more convenient subjectAltName */
-					sans = x509->create_subjectAltName_enumerator(x509);
-					if (!sans->enumerate(sans, &id))
-					{
-						id = cert->get_subject(cert);
-					}
-					id = id->clone(id);
-					sans->destroy(sans);
-
+					id = get_smartcard_id(cert);
 					if (probe)
 					{
 						key->destroy(key);
@@ -606,16 +696,27 @@ static bool add_auth_cfg_cert(NMStrongswanPluginPrivate *priv,
 
 	if (streq(cert_source, "smartcard"))
 	{
-		char *pin;
+		char *pin, *uri;
 
 		/* the PIN is optional, as tokens might not require a login */
 		pin = (char*)nm_setting_vpn_get_secret(vpn, "password");
-		id = find_smartcard_key(priv, pin, FALSE);
+		uri = get_smartcard_uri(vpn);
+		if (uri)
+		{
+			id = find_smartcard_key_by_uri(priv, uri, pin, FALSE, &cert, err);
+		}
+		else
+		{
+			id = find_smartcard_key(priv, pin, FALSE);
+			if (!id)
+			{
+				g_set_error(err, NM_VPN_PLUGIN_ERROR,
+							NM_VPN_PLUGIN_ERROR_BAD_ARGUMENTS,
+							"No usable smartcard certificate found.");
+			}
+		}
 		if (!id)
 		{
-			g_set_error(err, NM_VPN_PLUGIN_ERROR,
-						NM_VPN_PLUGIN_ERROR_BAD_ARGUMENTS,
-						"No usable smartcard certificate found.");
 			return FALSE;
 		}
 	}
@@ -1224,9 +1325,19 @@ static gboolean need_secrets(NMVpnServicePlugin *plugin, NMConnection *connectio
 				if (need_secret)
 				{
 					identification_t *id;
+					char *uri;
 
 					/* no PIN is needed if the token does not require a login */
-					id = find_smartcard_key(priv, NULL, TRUE);
+					uri = get_smartcard_uri(settings);
+					if (uri)
+					{
+						id = find_smartcard_key_by_uri(priv, uri, NULL, TRUE,
+													   NULL, NULL);
+					}
+					else
+					{
+						id = find_smartcard_key(priv, NULL, TRUE);
+					}
 					if (id)
 					{
 						id->destroy(id);
