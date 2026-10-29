@@ -41,6 +41,7 @@
 
 #include "pkcs11_library.h"
 #include "pkcs11_manager.h"
+#include "pkcs11_creds.h"
 #include "pkcs11_public_key.h"
 
 #include <utils/debug.h>
@@ -1000,9 +1001,10 @@ static public_key_t* find_pubkey_in_certs(private_pkcs11_private_key_t *this,
 pkcs11_private_key_t *pkcs11_private_key_connect(key_type_t type, va_list args)
 {
 	private_pkcs11_private_key_t *this;
-	char *module = NULL;
+	char *module = NULL, *uri = NULL;
 	chunk_t keyid = chunk_empty, ckaid = chunk_empty;
 	int slot = -1;
+	bool found = FALSE;
 	CK_RV rv;
 
 	while (TRUE)
@@ -1018,6 +1020,9 @@ pkcs11_private_key_t *pkcs11_private_key_connect(key_type_t type, va_list args)
 			case BUILD_PKCS11_MODULE:
 				module = va_arg(args, char*);
 				continue;
+			case BUILD_PKCS11_URI:
+				uri = va_arg(args, char*);
+				continue;
 			case BUILD_END:
 				break;
 			default:
@@ -1025,7 +1030,7 @@ pkcs11_private_key_t *pkcs11_private_key_connect(key_type_t type, va_list args)
 		}
 		break;
 	}
-	if (!keyid.len)
+	if (!keyid.len && !uri)
 	{
 		return NULL;
 	}
@@ -1050,7 +1055,29 @@ pkcs11_private_key_t *pkcs11_private_key_connect(key_type_t type, va_list args)
 		.ref = 1,
 	);
 
-	if (module && slot != -1)
+	if (uri)
+	{
+		CK_SLOT_ID current;
+
+		/* the key is on the token of the certificate selected by the URI */
+		if (!pkcs11_creds_find_by_uri(uri, &this->lib, &current, &ckaid, NULL))
+		{
+			free(this);
+			return NULL;
+		}
+		slot = current;
+		if (!keyid.len)
+		{	/* use the CKA_ID of the certificate to look up a PIN */
+			keyid = ckaid;
+		}
+		if (!keyid.len)
+		{
+			DBG1(DBG_CFG, "PKCS#11 certificate has no CKA_ID");
+			free(this);
+			return NULL;
+		}
+	}
+	else if (module && slot != -1)
 	{
 		this->lib = find_lib(module);
 		if (!this->lib)
@@ -1085,6 +1112,7 @@ pkcs11_private_key_t *pkcs11_private_key_connect(key_type_t type, va_list args)
 	{
 		DBG1(DBG_CFG, "opening private key session on '%s':%d failed: %N",
 			 module, slot, ck_rv_names, rv);
+		chunk_free(&ckaid);
 		free(this);
 		return NULL;
 	}
@@ -1094,21 +1122,34 @@ pkcs11_private_key_t *pkcs11_private_key_connect(key_type_t type, va_list args)
 
 	if (!login(this, slot))
 	{
+		chunk_free(&ckaid);
 		destroy(this);
 		return NULL;
 	}
 
 	if (ckaid.ptr)
 	{
-		DBG1(DBG_CFG, "using CKA_ID '%#B' for key with keyid '%#B'",
-			 &ckaid, &keyid);
-		keyid = ckaid;
+		if (!chunk_equals(ckaid, keyid))
+		{
+			DBG1(DBG_CFG, "using CKA_ID '%#B' for key with keyid '%#B'",
+				 &ckaid, &keyid);
+		}
+		found = find_key(this, ckaid);
+		if (found)
+		{
+			keyid = ckaid;
+		}
 	}
-
-	if (!find_key(this, keyid))
+	if (!found && (!ckaid.ptr || (uri && !chunk_equals(ckaid, keyid))))
+	{	/* the key of a certificate selected by URI might not share its CKA_ID,
+		 * fall back to the keyid (e.g. the subjectKeyIdentifier) */
+		found = find_key(this, keyid);
+	}
+	if (!found)
 	{
 		DBG1(DBG_CFG, "did not find the key with %s '%#B'",
-			 ckaid.ptr ? "CKA_ID" : "keyid", &keyid);
+			 ckaid.ptr ? "CKA_ID" : "keyid", ckaid.ptr ? &ckaid : &keyid);
+		chunk_free(&ckaid);
 		destroy(this);
 		return NULL;
 	}
@@ -1122,9 +1163,11 @@ pkcs11_private_key_t *pkcs11_private_key_connect(key_type_t type, va_list args)
 			DBG1(DBG_CFG, "no public key or certificate found for private key "
 				 "(%s '%#B') on '%s':%d", ckaid.ptr ? "CKA_ID" : "keyid",
 				 &keyid, module, slot);
+			chunk_free(&ckaid);
 			destroy(this);
 			return NULL;
 		}
 	}
+	chunk_free(&ckaid);
 	return &this->public;
 }
