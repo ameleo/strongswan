@@ -527,10 +527,11 @@ static chunk_t read_safe_file(NMStrongswanPluginPrivate *priv,
 }
 
 /**
- * Find a certificate for which we have a private key on a smartcard
+ * Find a certificate for which we have a private key on a smartcard, if probe
+ * is TRUE, the certificate and key are not installed for authentication
  */
 static identification_t *find_smartcard_key(NMStrongswanPluginPrivate *priv,
-											char *pin)
+											char *pin, bool probe)
 {
 	enumerator_t *enumerator, *sans;
 	identification_t *id = NULL;
@@ -553,7 +554,10 @@ static identification_t *find_smartcard_key(NMStrongswanPluginPrivate *priv,
 			if (keyid.ptr)
 			{
 				/* try to find a private key by the certificate keyid */
-				priv->creds->set_pin(priv->creds, keyid, pin);
+				if (!probe)
+				{
+					priv->creds->set_pin(priv->creds, keyid, pin);
+				}
 				key = lib->creds->create(lib->creds, CRED_PRIVATE_KEY,
 								KEY_ANY, BUILD_PKCS11_KEYID, keyid, BUILD_END);
 				if (key)
@@ -567,6 +571,11 @@ static identification_t *find_smartcard_key(NMStrongswanPluginPrivate *priv,
 					id = id->clone(id);
 					sans->destroy(sans);
 
+					if (probe)
+					{
+						key->destroy(key);
+						break;
+					}
 					DBG1(DBG_CFG, "using smartcard certificate '%Y'", id);
 					priv->creds->set_cert_and_key(priv->creds,
 												  cert->get_ref(cert), key);
@@ -599,11 +608,9 @@ static bool add_auth_cfg_cert(NMStrongswanPluginPrivate *priv,
 	{
 		char *pin;
 
+		/* the PIN is optional, as tokens might not require a login */
 		pin = (char*)nm_setting_vpn_get_secret(vpn, "password");
-		if (pin)
-		{
-			id = find_smartcard_key(priv, pin);
-		}
+		id = find_smartcard_key(priv, pin, FALSE);
 		if (!id)
 		{
 			g_set_error(err, NM_VPN_PLUGIN_ERROR,
@@ -1214,6 +1221,18 @@ static gboolean need_secrets(NMVpnServicePlugin *plugin, NMConnection *connectio
 			else if (streq(cert_source, "smartcard"))
 			{
 				need_secret = !nm_setting_vpn_get_secret(settings, "password");
+				if (need_secret)
+				{
+					identification_t *id;
+
+					/* no PIN is needed if the token does not require a login */
+					id = find_smartcard_key(priv, NULL, TRUE);
+					if (id)
+					{
+						id->destroy(id);
+						need_secret = FALSE;
+					}
+				}
 			}
 			else
 			{
